@@ -30,6 +30,7 @@ dev = [
   "pytest-cov>=5.0,<6",
   "hypothesis>=6.112,<7",
   "testcontainers[mysql]>=4.8,<5",
+  "locust>=2.31,<3",
 ]
 
 [build-system]

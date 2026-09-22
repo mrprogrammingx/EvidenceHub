@@ -4,7 +4,7 @@ SHELL := /bin/bash
 UV := uv
 CORE_SERVICES := mysql-catalog mysql-shard-1 mysql-shard-2 mysql-shard-3 mysql-shard-4 redis
 
-.PHONY: help up down down-clean ps migrate-legacy seed seed-full lint fmt typecheck test check demo clean
+.PHONY: help up down down-clean ps migrate-legacy seed seed-full lint fmt typecheck test check demo clean bench bench-capture bench-load bench-report
 
 help:
 	@echo "EvidenceHub -- make targets:"
@@ -21,6 +21,10 @@ help:
 	@echo "  test           Run unit tests with coverage"
 	@echo "  check          lint + typecheck + test (what CI runs)"
 	@echo "  demo           up + migrate-legacy + seed, end to end (grows each phase)"
+	@echo "  bench          bench-capture + bench-load + bench-report, writes docs/perf/baseline.md"
+	@echo "  bench-capture  Capture EXPLAIN ANALYZE + performance_schema stats per critical query"
+	@echo "  bench-load     Run the Locust load harness against the critical queries"
+	@echo "  bench-report   Render docs/perf/baseline.md from the two captures above"
 	@echo "  clean          down-clean + remove local tool caches"
 
 .env:
@@ -72,6 +76,19 @@ test:
 	$(UV) run pytest tests/unit --cov --cov-report=term-missing
 
 check: lint typecheck test
+
+bench-capture: .env
+	$(UV) run python bench/capture_explain.py
+
+bench-load: .env
+	$(UV) run locust -f bench/locustfile.py --headless \
+		--users 8 --spawn-rate 8 --run-time 60s \
+		--csv bench/out/baseline --host mysql://legacy
+
+bench-report: .env
+	$(UV) run python bench/report.py --csv-prefix bench/out/baseline --locust-users 8 --locust-duration 60s
+
+bench: bench-capture bench-load bench-report
 
 demo: up migrate-legacy seed
 	@echo "Demo (current phase slice): core services up, legacy schema migrated, dev-scale data seeded."

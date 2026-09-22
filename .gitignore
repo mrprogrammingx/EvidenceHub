@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# uv
+.uv/
+
+# Testing / coverage
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Docker / data volumes
+infra/docker/data/
+*.sql.gz
+
+# Terraform
+infra/terraform/**/.terraform/
+infra/terraform/**/.terraform.lock.hcl
+infra/terraform/**/*.tfstate
+infra/terraform/**/*.tfstate.backup
+infra/terraform/**/*.tfplan
+
+# Spark / Iceberg local warehouse
+warehouse/spark/_checkpoints/
+warehouse/spark/_warehouse/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Airflow
+airflow/logs/
+airflow/*.db
+
+# Perf harness raw output (reports in docs/perf/ are curated and committed)
+bench/out/

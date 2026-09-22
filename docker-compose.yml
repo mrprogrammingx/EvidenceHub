@@ -1,0 +1,115 @@
+name: evidencehub
+
+x-mysql-common: &mysql-common
+  image: mysql:8.0
+  restart: unless-stopped
+  command:
+    - --character-set-server=utf8mb4
+    - --collation-server=utf8mb4_0900_ai_ci
+    - --innodb-buffer-pool-size=512M
+    - --innodb-buffer-pool-instances=1
+    - --innodb-flush-log-at-trx-commit=2
+    - --innodb-file-per-table=1
+    - --max-connections=200
+    - --performance-schema=ON
+    - --local-infile=1
+  environment:
+    MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root_password}
+  healthcheck:
+    test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-change_me_root_password}"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+    start_period: 30s
+  profiles: ["core"]
+
+services:
+  mysql-catalog:
+    <<: *mysql-common
+    container_name: evidencehub-mysql-catalog
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root_password}
+      MYSQL_DATABASE: ${MYSQL_CATALOG_DB:-evidencehub_catalog}
+      MYSQL_USER: ${MYSQL_CATALOG_USER:-evidencehub}
+      MYSQL_PASSWORD: ${MYSQL_CATALOG_PASSWORD:-change_me_dev_password}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_catalog_data:/var/lib/mysql
+
+  mysql-shard-1:
+    <<: *mysql-common
+    container_name: evidencehub-mysql-shard-1
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root_password}
+      MYSQL_DATABASE: ${MYSQL_SHARD_DB_PREFIX:-evidencehub_shard}_0
+      MYSQL_USER: ${MYSQL_SHARD_USER:-evidencehub}
+      MYSQL_PASSWORD: ${MYSQL_SHARD_PASSWORD:-change_me_dev_password}
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_shard1_data:/var/lib/mysql
+
+  mysql-shard-2:
+    <<: *mysql-common
+    container_name: evidencehub-mysql-shard-2
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root_password}
+      MYSQL_DATABASE: ${MYSQL_SHARD_DB_PREFIX:-evidencehub_shard}_1
+      MYSQL_USER: ${MYSQL_SHARD_USER:-evidencehub}
+      MYSQL_PASSWORD: ${MYSQL_SHARD_PASSWORD:-change_me_dev_password}
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql_shard2_data:/var/lib/mysql
+
+  mysql-shard-3:
+    <<: *mysql-common
+    container_name: evidencehub-mysql-shard-3
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root_password}
+      MYSQL_DATABASE: ${MYSQL_SHARD_DB_PREFIX:-evidencehub_shard}_2
+      MYSQL_USER: ${MYSQL_SHARD_USER:-evidencehub}
+      MYSQL_PASSWORD: ${MYSQL_SHARD_PASSWORD:-change_me_dev_password}
+    ports:
+      - "3309:3306"
+    volumes:
+      - mysql_shard3_data:/var/lib/mysql
+
+  mysql-shard-4:
+    <<: *mysql-common
+    container_name: evidencehub-mysql-shard-4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root_password}
+      MYSQL_DATABASE: ${MYSQL_SHARD_DB_PREFIX:-evidencehub_shard}_3
+      MYSQL_USER: ${MYSQL_SHARD_USER:-evidencehub}
+      MYSQL_PASSWORD: ${MYSQL_SHARD_PASSWORD:-change_me_dev_password}
+    ports:
+      - "3310:3306"
+    volumes:
+      - mysql_shard4_data:/var/lib/mysql
+
+  redis:
+    image: redis:7-alpine
+    container_name: evidencehub-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    profiles: ["core"]
+
+volumes:
+  mysql_catalog_data:
+  mysql_shard1_data:
+  mysql_shard2_data:
+  mysql_shard3_data:
+  mysql_shard4_data:
+  redis_data:

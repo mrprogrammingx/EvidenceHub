@@ -8,6 +8,7 @@ on:
 
 env:
   UV_VERSION: "0.11.21"
+  GITLEAKS_VERSION: "8.24.3"
 
 jobs:
   lint:
@@ -52,6 +53,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Full-history scan via the gitleaks CLI directly, not gitleaks-action:
+      # the action diffs against the previous push's "before" SHA, which has
+      # no parent on a repo's very first push and fails with "unknown
+      # revision". Scanning full history every run is strictly more
+      # thorough and sidesteps that push-event edge case entirely.
+      - run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar xz -C /usr/local/bin gitleaks
+      - run: gitleaks detect --source . --redact -v

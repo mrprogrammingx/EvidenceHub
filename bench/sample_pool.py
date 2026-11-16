@@ -8,6 +8,7 @@ values that would always miss.
 from __future__ import annotations
 
 import random
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -35,12 +36,17 @@ class SamplePool:
 
 
 def load_sample_pool(engine: Engine, sample_size: int = 500, window_days: int = 180) -> SamplePool:
+    # `ORDER BY RAND() LIMIT n` sorts the whole table (a full scan) to pick a
+    # random sample -- fine at dev scale, minutes-long at 5M+ rows/shard. id
+    # is a random UUID PK, so seeking to a random point in it and scanning
+    # forward via the PK index is a cheap, still-effectively-random sample.
+    random_seek = str(uuid.uuid4())
     query = text(
         "SELECT id, entity_id, status, evidence_type, observed_at, content_hash "
-        "FROM evidence_legacy ORDER BY RAND() LIMIT :n"
+        "FROM evidence_legacy WHERE id >= :seek ORDER BY id LIMIT :n"
     )
     with engine.connect() as conn:
-        result = conn.execute(query, {"n": sample_size})
+        result = conn.execute(query, {"seek": random_seek, "n": sample_size})
         rows = [SampleRow(**dict(row._mapping)) for row in result]
     if not rows:
         raise RuntimeError("evidence_legacy is empty -- run the seed generator first")

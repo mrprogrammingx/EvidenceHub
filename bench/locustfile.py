@@ -11,10 +11,22 @@ chosen shard with realistic bound parameters drawn from that shard's sample
 pool (see sample_pool.py). Locust's own request-stats machinery (fired via
 events.request) gives p50/p66/p75/.../p99.9 and RPS per query "name" in the
 --csv output, with no custom percentile math needed.
+
+Set BENCH_QUERY_NAMES to a comma-separated subset of query names to load-test
+only those (the rest still get single-shot numbers from capture_explain.py).
+On the legacy schema this matters: several critical queries cost tens of
+seconds to minutes per execution (full table scans over 5M+ rows), so a real
+concurrent load test against them is impractical and not representative of
+anything a production system would be asked to do -- their single-execution
+capture already proves the SLO violation by 3-4 orders of magnitude. Use this
+to scope Locust to the queries that are actually fast enough to load-test
+meaningfully (P1: the legacy schema's indexed queries; P2+: expected to be
+all 8, once the optimized schema makes them fast).
 """
 
 from __future__ import annotations
 
+import os
 import random
 import sys
 import time
@@ -33,6 +45,10 @@ from sqlalchemy import Engine, create_engine, text  # noqa: E402
 from evidencehub.common.config import get_settings  # noqa: E402
 
 QUERIES = load_critical_queries()
+_selected = os.environ.get("BENCH_QUERY_NAMES")
+if _selected:
+    _wanted = {name.strip() for name in _selected.split(",") if name.strip()}
+    QUERIES = [q for q in QUERIES if q.name in _wanted]
 SETTINGS = get_settings()
 
 _engines: list[Engine] = []

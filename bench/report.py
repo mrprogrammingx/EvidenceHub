@@ -71,6 +71,23 @@ def _classify_index_usage(explain_text: str) -> str:
     return "unknown (see EXPLAIN ANALYZE text)"
 
 
+@dataclass
+class EffectiveLatency:
+    p50_ms: float
+    p95_ms: float
+    p99_ms: float
+    source: str  # "locust (Nx)" or "single-shot"
+
+
+def _effective_latency(ls: LocustStats | None, capture: dict[str, Any]) -> EffectiveLatency | None:
+    if ls is not None:
+        return EffectiveLatency(ls.p50_ms, ls.p95_ms, ls.p99_ms, f"locust ({ls.request_count}x)")
+    wall_ms = capture.get("wall_ms")
+    if wall_ms is not None:
+        return EffectiveLatency(wall_ms, wall_ms, wall_ms, "single-shot")
+    return None
+
+
 def _actual_row_counts() -> tuple[list[int], int]:
     settings = get_settings()
     counts = []
@@ -109,10 +126,19 @@ def _render(
         "~0-50ms think time."
     )
     lines.append("")
+    lines.append(
+        "Queries costing tens of seconds to minutes per execution (full scans over "
+        "5M+ rows) were not concurrency-load-tested: a real Locust load test against "
+        "them is impractical (a single request can outlive the whole test run) and not "
+        "representative of anything a production system would be asked to do. Those "
+        "rows report a **single-shot** wall-clock measurement instead (source column), "
+        "which already proves the SLO violation by 2-4 orders of magnitude."
+    )
+    lines.append("")
     lines.append("## Summary")
     lines.append("")
     lines.append(
-        "| Query | SLO (p95) | p50 | p95 | p99 | Requests | Rows examined | Index used | Verdict |"
+        "| Query | SLO (p95) | p50 | p95 | p99 | Source | Rows examined | Index used | Verdict |"
     )
     lines.append("|---|---|---|---|---|---|---|---|---|")
 
@@ -121,17 +147,18 @@ def _render(
         capture = explain_captures.get(spec.name, {})
         rows_examined = capture.get("rows_examined")
         index_usage = _classify_index_usage(capture.get("explain_analyze", ""))
-        if ls is None:
+        latency = _effective_latency(ls, capture)
+        if latency is None:
             lines.append(
-                f"| {spec.name} | p95 < {spec.slo_ms}ms | - | - | - | 0 | "
+                f"| {spec.name} | p95 < {spec.slo_ms}ms | - | - | - | none | "
                 f"{rows_examined} | {index_usage} | NO DATA |"
             )
             continue
-        verdict = "PASS" if ls.p95_ms < spec.slo_ms else "FAIL"
+        verdict = "PASS" if latency.p95_ms < spec.slo_ms else "FAIL"
         lines.append(
-            f"| {spec.name} | p95 < {spec.slo_ms}ms | {ls.p50_ms:.1f}ms | {ls.p95_ms:.1f}ms | "
-            f"{ls.p99_ms:.1f}ms | {ls.request_count} | {rows_examined} | "
-            f"{index_usage} | {verdict} |"
+            f"| {spec.name} | p95 < {spec.slo_ms}ms | {latency.p50_ms:.1f}ms | "
+            f"{latency.p95_ms:.1f}ms | {latency.p99_ms:.1f}ms | {latency.source} | "
+            f"{rows_examined} | {index_usage} | {verdict} |"
         )
 
     lines.append("")

@@ -48,11 +48,45 @@ rather than being generically "bad":
 
 ## Baseline benchmark findings (P1)
 
-See `docs/perf/baseline.md` for the full, measured results. Summary of what the run confirmed as
-the biggest offenders P2 needs to fix, ranked by how far each query landed from its SLO:
+See `docs/perf/baseline.md` for the full, measured results (20,987,598 rows across 4 shards --
+104.9% of the 20M target, reached by the seed generator's own random per-entity row-count
+variance, not a partial/truncated run). Summary of what the run confirmed as the biggest
+offenders P2 needs to fix, ranked by how far each query landed from its SLO (p95, single-shot
+wall-clock where noted -- see baseline.md for why 6 of the 8 queries could not be concurrency
+load-tested):
 
-_(filled in after the P1 benchmark run completes -- see docs/perf/baseline.md for the numbers
-this table is built from)_
+| Query | SLO | Measured p95 | Factor over SLO | Index used |
+|---|---|---|---|---|
+| per_entity_status_aggregate | 50ms | 124,318ms | ~2,486x | `ix_evidence_legacy_status` (index scan, not seek -- no leading `entity_id`) |
+| range_aggregate_status_window | 300ms | 132,526ms | ~442x | `ix_evidence_legacy_status` (index scan, not seek -- no leading `observed_at`) |
+| keyset_paginated_feed | 50ms | 55,473ms | ~1,109x | full table scan |
+| top_entities_by_volume_window | 300ms | 64,947ms | ~216x | full table scan |
+| content_hash_dedup_lookup | 50ms | 21,412ms | ~428x | full table scan |
+| latest_n_by_entity_type_daterange | 50ms | 34,508ms | ~690x | full table scan |
+| latest_n_by_entity_status | 50ms | 16ms | PASS | `ix_evidence_legacy_status_entity` (index seek -- both predicates are equality, so the "wrong-leading-column" index still serves it) |
+| point_lookup_by_id | 50ms | 4ms | PASS | primary key (const lookup) |
+
+One correction to the anti-pattern table above: `latest_n_by_entity_status` was predicted to have
+"no supporting index at all," but `ix_evidence_legacy_status_entity` (status, entity_id) *does*
+serve it efficiently here because both `status` and `entity_id` are equality predicates -- a
+composite index can be used for an equality match on a non-leading column as long as every column
+before it in the index is also equality-constrained. The index is still mis-shaped for the more
+general "recent evidence for entity X, any status" access pattern, which is not measured here.
+
+**Root cause confirmed, not assumed:** on `evidencehub-mysql-shard-1`, `innodb_buffer_pool_size` =
+512 MiB exactly against a ~5.08 GiB `evidence_legacy` table (~10x the pool, per shard). An
+isolated forced full clustered-index scan (`FORCE INDEX (PRIMARY)`, 5,247,983 rows, no concurrent
+load) measured a **50.2% InnoDB buffer pool hit ratio** via before/after
+`Innodb_buffer_pool_read%` deltas, and `SHOW ENGINE INNODB STATUS` immediately after showed the
+pool 100% occupied (0 free buffers) and I/O overwhelmingly read-dominated (215,318 OS file reads
+vs. 332 writes). Full details and raw capture: `docs/perf/baseline.md` and
+`docs/perf/innodb_status_shard1_20260922.txt`. This directly motivates P2's scope: a narrower,
+better-clustered `evidence` table (BIGINT PK instead of random UUID, payload moved out of the hot
+row) plus indexes with `entity_id`/`observed_at` leading, so the working set for the hot access
+patterns -- not the whole table -- is what has to fit in a buffer pool sized for this machine's
+Docker VM budget. Simply enlarging the buffer pool was deliberately not tried here (P1's job is to
+measure the deliberately-bad baseline honestly, not patch it); P2 should treat buffer pool sizing
+as one lever among several, not a substitute for fixing the PK/index design.
 
 ## Consequences
 

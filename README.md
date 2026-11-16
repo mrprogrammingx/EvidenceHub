@@ -27,6 +27,18 @@ Every performance number in this repo is a real measurement, run on the hardware
 
 Targets assume ≥ 20M rows across 4 shards. Actual measured results live in `docs/perf/`.
 
+## Baseline load test (legacy schema, P1)
+
+Locust UI run against the legacy schema at ~21M rows, 8 users, ~5 minutes, limited to the two
+critical queries fast enough to load-test (`BENCH_QUERY_NAMES=point_lookup_by_id,latest_n_by_entity_status`).
+Both stay inside their 50 ms p95 SLO with 0 failures at ~290 RPS. The other 6 critical queries
+take 16-132 s per execution on the legacy schema and are reported single-shot in
+[`docs/perf/baseline.md`](docs/perf/baseline.md). The early p95 spike in the charts is cold-cache
+warm-up. Numbers differ slightly from `baseline.md` (separate, longer run).
+
+![Locust statistics](docs/perf/img/locust-statistics.png)
+![Locust charts](docs/perf/img/locust-charts.png)
+
 ## Scale limit
 
 Defaults are sized to run on a **16 GB laptop** (20M rows, 4 shards) and are parameterized to

@@ -235,37 +235,48 @@ def check_dims(conn: Connection, last_id: str) -> dict[str, Any]:
     return {"legacy_distinct": dict(legacy._mapping), "new_counts": dict(new._mapping)}
 
 
+MAX_LEGACY_ID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+
+
+def verify(conn: Connection, last_id: str, chunk: int, spot: int, seed: int) -> dict[str, Any]:
+    result = {
+        "last_legacy_id": last_id,
+        "months": check_months(conn, last_id),
+        "chunks": check_chunks(conn, last_id, chunk),
+        "spot": spot_check(conn, last_id, spot, seed),
+        "dims": check_dims(conn, last_id),
+    }
+    result["ok"] = (
+        not result["months"]["mismatched_months"]
+        and not result["chunks"]["mismatched_chunks"]
+        and not result["spot"]["failures"]
+        and result["months"]["legacy_rows"] == result["months"]["new_rows"]
+    )
+    return result
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--shard", type=int, required=True)
-    p.add_argument("--job", default="sample")
+    scope = p.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--job", help="verify the legacy PK range a pk-order job covered")
+    scope.add_argument("--all", action="store_true", help="verify the whole legacy table")
     p.add_argument("--chunk", type=int, default=2000)
     p.add_argument("--spot", type=int, default=200)
     p.add_argument("--seed", type=int, default=20261119)
     a = p.parse_args()
     engine = create_engine(get_settings().shard_url(a.shard), pool_pre_ping=True)
     with engine.connect() as conn:
-        row = conn.exec_driver_sql(
-            "SELECT last_legacy_id, rows_scanned FROM backfill_progress WHERE job=%s", (a.job,)
-        ).one()
-        last_id = row[0]
-        conn.rollback()
-        result = {
-            "job": a.job,
-            "last_legacy_id": last_id,
-            "rows_scanned_by_job": row[1],
-            "months": check_months(conn, last_id),
-            "chunks": check_chunks(conn, last_id, a.chunk),
-            "spot": spot_check(conn, last_id, a.spot, a.seed),
-            "dims": check_dims(conn, last_id),
-        }
+        if a.all:
+            last_id = MAX_LEGACY_ID
+        else:
+            last_id = conn.exec_driver_sql(
+                "SELECT last_legacy_id FROM backfill_progress WHERE job=%s", (a.job,)
+            ).scalar_one()
+            conn.rollback()
+        result = verify(conn, last_id, a.chunk, a.spot, a.seed)
     print(json.dumps(result, indent=2, default=str))
-    ok = (
-        not result["months"]["mismatched_months"]
-        and not result["chunks"]["mismatched_chunks"]
-        and not result["spot"]["failures"]
-    )
-    sys.exit(0 if ok else 1)
+    sys.exit(0 if result["ok"] else 1)
 
 
 if __name__ == "__main__":

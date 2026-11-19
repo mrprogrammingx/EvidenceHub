@@ -77,5 +77,18 @@ biased comparison.
 Go/no-go rule (owner, 2026-11-19): month-ordered only if bytes/row drops ≥25% **and** the
 per-month legacy scan is about 2 minutes or less. Bytes/row passes clearly. The scan
 measured 135.1s, about 15s over. **Outcome: pending the owner's decision**, because the
-disk projection shows only month-ordered loading comes close to fitting (see the P2
-backfill plan).
+disk projection shows only month-ordered loading comes close to fitting.
+
+**Decided by the owner (2026-11-19): month-ordered for shards 1–3, with the 2-minute scan
+bar waived** (bytes/row passed; the miss was 15s of wall-clock). Each shard is verified
+(`verify_backfill.py --all`), then its binlogs are purged. No legacy table is dropped. After
+shard 3, shard 4 is re-projected from the measured growth and put back to the owner
+(free other space on the host, or stop at three shards).
+
+Month-order mechanics: each month is one streamed legacy scan ordered by
+`(observed_at, id)`, checkpointed per batch as `(cursor_observed_at, last_legacy_id)`
+(migration `0003_backfill_month_cursor`). A completed month is skipped without rescanning;
+an interrupted one resumes after its cursor. Rows already loaded by the PK-order sample on
+shard 1 are skipped by `write_records`. On shard 1 the month-ordered rows still interleave
+with the 1M sample rows already in each partition, so its density will land between the
+two measured figures.

@@ -28,16 +28,27 @@ Accepted (P2). Code: `evidencehub/common/snowflake.py`.
   `observed_at` order, so a load in `observed_at` order is a sequential insert.
 - Backfill ids are **deterministic**: the sub-second offset is `crc32(legacy_id) % 1000`,
   the sequence is `(crc32(legacy_id) // 1000) % 4096`. Re-running the backfill over a row
-  produces the same id, so a resumed or repeated run cannot create duplicates; it fails on
-  the primary key instead.
+  produces the same id, so a resumed or repeated run recognises the row as already loaded
+  and skips it instead of duplicating it.
 
 ### Collision analysis
 
 - **Backfill:** two backfilled rows can only share an id if they fall in the same
   second (time bits), the same bucket, and the same 22 hash-derived bits. Expected
-  collisions per ~5.2M-row shard are about 1e-4. A collision always has identical
-  `observed_at` seconds, so the `(id, observed_at)` PK rejects it loudly. The 1M-row sample
-  on shard 1 wrote 1,000,000 rows with no PK error.
+  collisions per ~5.2M-row shard are about 1e-4. The 1M-row sample on shard 1 wrote
+  1,000,000 rows with none.
+- **What happens on a collision (decided 2026-11-19): stop, never quarantine.**
+  `write_records` raises `IdCollisionError` naming the legacy ids, whether the twin is in
+  the same batch or already in `evidence` with a different `content_hash`. The batch rolls
+  back, the checkpoint does not advance, and the backfill exits with code 4. Quarantining
+  and continuing would leave a legacy row with no optimized row, which the cutover
+  forbids. Resolution is a manual, reviewed remap of the later row; an automatic
+  re-salt would make ids depend on load order and break re-run idempotency.
+  Tested with a natural collision found by birthday search
+  (`tests/integration/test_backfill.py::test_id_collision_stops_and_names_legacy_ids`).
+- **Re-runs vs. collisions.** An existing `(id, observed_at)` with the *same*
+  `content_hash` is the same legacy row loaded earlier (PK-order sample, an interrupted
+  month, a forgotten checkpoint) and is skipped. Only a *different* hash is a collision.
 - **Live writes:** unique and monotonic per bucket **within one process** (a lock plus
   per-bucket last-ms and sequence; clock steps backwards are absorbed). The layout has no
   worker bits, so **two processes generating ids for the same bucket can collide**, and
@@ -47,6 +58,30 @@ Accepted (P2). Code: `evidencehub/common/snowflake.py`.
   design must either assign bucket ownership to a single writer or add an id registry.
   The P2 dual-writer is a single-process test writer, so it meets this constraint.
 
+### Duplicate content hashes: one rule for both write paths
+
+**Every legacy row gets an optimized row; `evidence_content_hash` is first-writer-wins.**
+The backfill and the dual-writer both write through
+`evidencehub/migration/writer.py::write_records`, so the rule cannot drift between them:
+
+- the `evidence` and `evidence_payload` rows are always written;
+- `evidence_content_hash` keeps pointing at the first id inserted for that hash
+  (`INSERT ... ON DUPLICATE KEY UPDATE evidence_id = evidence_id`);
+- later rows are reported as `duplicate_of = <first id>`. Ingestion (P4) decides what to do
+  with that signal; the storage layer never drops a row.
+
+The P2 dual-writer previously skipped the optimized row on a duplicate. That was changed
+so the optimized table holds every legacy row, as the cutover requires.
+
+### No `INSERT IGNORE`
+
+`INSERT IGNORE` turns strict-mode errors (data too long, NULL into NOT NULL) into warnings
+and stores truncated or default values. All inserts that can legitimately meet an
+existing key use a no-op `ON DUPLICATE KEY UPDATE`, which only absorbs the duplicate key;
+every other error still raises (shards run with `STRICT_TRANS_TABLES`). Duplicate
+detection reads the owning id back instead of trusting `rowcount`, because SQLAlchemy's
+pymysql dialect sets `CLIENT_FOUND_ROWS`, which makes a no-op upsert report one row.
+
 ### Dedup scope
 
 `evidence_content_hash (content_hash BINARY(32) PRIMARY KEY, evidence_id)` is
@@ -54,9 +89,21 @@ non-partitioned, so it can enforce uniqueness where `evidence` cannot (ADR 0002)
 
 It is **per shard**. Placement is by entity, so identical content attached to two
 entities on different shards is not detected. **Cross-shard dedup is out of scope until
-P3's global lookup index.** The legacy data has no duplicate hashes in the shard-1 sample
-(1,000,000 rows, 1,000,000 distinct hashes; the hash includes the entity id and a random
-source id, see the seeder), so this does not affect the before/after comparison.
+P3's global lookup index.** The shard-1 sample had no duplicate hashes (1,000,000 rows,
+1,000,000 distinct), so this does not affect the before/after comparison.
+
+### `entity_pk` allocation (known limit)
+
+`entity_pk_for` derives `entity_pk` by parsing `entity-########` (8 digits, so at most
+99,999,999). It rejects any other shape loudly rather than guessing. This is deterministic
+and global with no lookup, which is what the backfill needs, but it only covers the
+legacy key format.
+
+For P4, keys of any other shape are allocated from a global registry in the catalog DB
+(P3): `entity_registry(entity_key VARCHAR(255) UNIQUE, entity_pk BIGINT UNSIGNED)`,
+issuing `entity_pk` values from **100,000,000 upward**, so they can never overlap a parsed
+legacy value. Legacy-shaped keys keep their parsed value and are registered with it.
+Until the registry exists, the dual-writer and backfill accept legacy-shaped keys only.
 
 ## Consequences
 

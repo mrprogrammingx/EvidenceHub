@@ -58,6 +58,7 @@ def parse_confidence(value: str | None) -> Decimal | None:
 class NormalizedEvidence:
     """One logical evidence row, with dimension *names* still unresolved to ids."""
 
+    legacy_id: str
     id: int
     observed_at: datetime
     entity_pk: int
@@ -80,6 +81,7 @@ def normalize_legacy_row(row: Any) -> NormalizedEvidence:
     """Normalize a row shaped like `evidence_legacy` (attribute access)."""
     observed = parse_observed_at(row.observed_at)
     return NormalizedEvidence(
+        legacy_id=row.id,
         id=backfill_id(observed, row.entity_id, row.id),
         observed_at=observed,
         entity_pk=entity_pk_for(row.entity_id),

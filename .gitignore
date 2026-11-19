@@ -54,3 +54,6 @@ airflow/*.db
 
 # Perf harness raw output (reports in docs/perf/ are curated and committed)
 bench/out/
+
+# Local runtime state (dual-write spool, etc.)
+var/

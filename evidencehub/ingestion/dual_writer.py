@@ -3,13 +3,18 @@
 Contract, per logical evidence row:
 
 1. Write ``evidence_legacy`` first and commit. Legacy stays the source of truth until
-   cutover, so a request never fails because of the new schema.
-2. In a second transaction, write the optimized side atomically: dedup claim in
-   ``evidence_content_hash``, dimensions, ``evidence``, ``evidence_payload``.
-   * If the content hash is already claimed on this shard, the optimized write is
-     skipped and the existing id is returned (legacy keeps its row, as it always has).
-3. If step 2 fails for any reason, roll it back, record the legacy id in
-   ``dualwrite_outbox``, and return the error instead of raising.
+   cutover, so a request never fails because of the new schema. If this step fails, the
+   exception propagates: nothing was written anywhere.
+2. In a second transaction, write the optimized side through
+   :func:`evidencehub.migration.writer.write_records`, the same path the backfill uses.
+   Every row is written; a repeated ``content_hash`` is reported as ``duplicate_of`` the
+   first id for that hash on this shard (ADR 0004).
+3. If step 2 fails for any reason, the legacy row is already committed, so it must be
+   recorded for reconciliation. In order:
+   a. ``dualwrite_outbox`` on a **fresh** connection (the failing one may be dead);
+   b. if that fails too, an fsync'd JSON line in a local spool file;
+   c. if even that fails, raise :class:`ReconciliationLostError` carrying the legacy id,
+      so the caller can never mistake an unrecorded divergence for success.
 
 Dedup is per shard: placement is by entity, so identical content on entities that live
 on different shards is not detected until P3's global lookup index (ADR 0004).
@@ -20,18 +25,33 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import Connection, Engine
 
 from evidencehub.common.snowflake import LiveIdGenerator, bucket_for, shard_for_bucket
 from evidencehub.migration.normalize import LEGACY_TS_FORMAT, normalize_legacy_row
+from evidencehub.migration.writer import Dims, write_records
 
 logger = logging.getLogger("evidencehub.ingestion.dual_writer")
+
+DEFAULT_SPOOL = Path("var/dualwrite_spool.jsonl")
+
+
+class ReconciliationLostError(RuntimeError):
+    """Legacy committed, optimized write failed, and neither outbox nor spool recorded it."""
+
+    def __init__(self, legacy_id: str, cause: str) -> None:
+        self.legacy_id = legacy_id
+        super().__init__(
+            f"legacy row {legacy_id} committed but not recorded for reconciliation: {cause}"
+        )
 
 
 @dataclass(frozen=True)
@@ -56,6 +76,7 @@ class WriteResult:
     evidence_id: int | None = None
     duplicate_of: int | None = None
     error: str | None = None
+    recorded_in: Literal["outbox", "spool"] | None = None
 
 
 class DualWriter:
@@ -65,38 +86,73 @@ class DualWriter:
         shard_index: int,
         shard_count: int = 4,
         id_gen: LiveIdGenerator | None = None,
+        spool_path: Path = DEFAULT_SPOOL,
     ) -> None:
         self._engine = engine
         self._shard_index = shard_index
         self._shard_count = shard_count
         self._ids = id_gen or LiveIdGenerator()
+        self._dims = Dims()
+        self._spool_path = spool_path
 
     def write(self, item: EvidenceInput) -> WriteResult:
         bucket = bucket_for(item.entity_key)
-        if shard_for_bucket(bucket, self._shard_count) != self._shard_index:
-            raise ValueError(
-                f"{item.entity_key} belongs to shard {shard_for_bucket(bucket, self._shard_count)}"
-                f", not {self._shard_index}"
-            )
-        legacy_id = str(uuid.uuid4())
-        legacy_row = self._legacy_row(legacy_id, item)
+        owner = shard_for_bucket(bucket, self._shard_count)
+        if owner != self._shard_index:
+            raise ValueError(f"{item.entity_key} belongs to shard {owner}, not {self._shard_index}")
+        legacy_row = self._legacy_row(str(uuid.uuid4()), item)
+        failure: str
         with self._engine.connect() as conn:
             self._insert_legacy(conn, legacy_row)
             conn.commit()
             try:
                 result = self._write_optimized(conn, legacy_row, bucket)
                 conn.commit()
+                self._dims.commit_pending()
                 return result
             except Exception as exc:
-                conn.rollback()
-                message = f"{type(exc).__name__}: {exc}"[:1024]
-                logger.warning("dual-write optimized side failed", extra={"legacy_id": legacy_id})
-                conn.exec_driver_sql(
+                self._dims.discard_pending()
+                failure = f"{type(exc).__name__}: {exc}"[:1024]
+                try:
+                    conn.rollback()
+                except Exception:
+                    logger.warning("rollback after optimized-side failure also failed")
+        return self._record_failure(legacy_row.id, failure)
+
+    def _record_failure(self, legacy_id: str, failure: str) -> WriteResult:
+        logger.warning(
+            "dual-write optimized side failed: %s", failure, extra={"legacy_id": legacy_id}
+        )
+        try:
+            with self._engine.connect() as fresh:
+                fresh.exec_driver_sql(
                     "INSERT INTO dualwrite_outbox (legacy_id, error) VALUES (%s, %s)",
-                    (legacy_id, message),
+                    (legacy_id, failure),
                 )
-                conn.commit()
-                return WriteResult(legacy_id=legacy_id, error=message)
+                fresh.commit()
+            return WriteResult(legacy_id=legacy_id, error=failure, recorded_in="outbox")
+        except Exception as outbox_exc:
+            outbox_error = f"{type(outbox_exc).__name__}: {outbox_exc}"
+            logger.error("outbox insert failed, spooling: %s", outbox_error)
+        try:
+            self._spool_path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(
+                {
+                    "legacy_id": legacy_id,
+                    "error": failure,
+                    "outbox_error": outbox_error,
+                    "at": datetime.now(UTC).isoformat(),
+                }
+            )
+            with self._spool_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            return WriteResult(legacy_id=legacy_id, error=failure, recorded_in="spool")
+        except OSError as spool_exc:
+            raise ReconciliationLostError(
+                legacy_id, f"{failure}; outbox: {outbox_error}; spool: {spool_exc}"
+            ) from spool_exc
 
     @staticmethod
     def _legacy_row(legacy_id: str, item: EvidenceInput) -> SimpleNamespace:
@@ -143,53 +199,7 @@ class DualWriter:
         self, conn: Connection, legacy: SimpleNamespace, bucket: int
     ) -> WriteResult:
         norm = dataclasses.replace(normalize_legacy_row(legacy), id=self._ids.next_id(bucket))
-        claimed = conn.exec_driver_sql(
-            "INSERT IGNORE INTO evidence_content_hash (content_hash, evidence_id) VALUES (%s, %s)",
-            (norm.content_hash, norm.id),
-        ).rowcount
-        if claimed == 0:
-            existing = conn.exec_driver_sql(
-                "SELECT evidence_id FROM evidence_content_hash WHERE content_hash = %s",
-                (norm.content_hash,),
-            ).scalar_one()
-            return WriteResult(legacy_id=legacy.id, duplicate_of=int(existing))
-        conn.exec_driver_sql(
-            "INSERT IGNORE INTO dim_entity (entity_pk, entity_key, name) VALUES (%s, %s, %s)",
-            (norm.entity_pk, norm.entity_key, norm.entity_name),
+        (outcome,) = write_records(conn, self._dims, [norm])
+        return WriteResult(
+            legacy_id=legacy.id, evidence_id=outcome.id, duplicate_of=outcome.duplicate_of
         )
-        conn.exec_driver_sql(
-            "INSERT IGNORE INTO dim_source (name, source_type) VALUES (%s, %s)",
-            (norm.source_name, norm.source_type),
-        )
-        conn.exec_driver_sql(
-            "INSERT IGNORE INTO dim_evidence_type (name) VALUES (%s)", (norm.evidence_type,)
-        )
-        inserted = conn.exec_driver_sql(
-            "INSERT INTO evidence (id, observed_at, entity_pk, source_id, type_id, status, "
-            "confidence_score, is_deleted, content_hash) "
-            "SELECT %s, %s, %s, s.source_id, t.type_id, %s, %s, %s, %s "
-            "FROM dim_source s JOIN dim_evidence_type t ON t.name = %s "
-            "WHERE s.name = %s AND s.source_type = %s",
-            (
-                norm.id,
-                norm.observed_at,
-                norm.entity_pk,
-                norm.status,
-                norm.confidence_score,
-                norm.is_deleted,
-                norm.content_hash,
-                norm.evidence_type,
-                norm.source_name,
-                norm.source_type,
-            ),
-        ).rowcount
-        if inserted != 1:
-            raise RuntimeError(
-                f"evidence insert affected {inserted} rows (dimension lookup failed)"
-            )
-        conn.exec_driver_sql(
-            "INSERT INTO evidence_payload (id, observed_at, payload, reviewer_notes) "
-            "VALUES (%s, %s, %s, %s)",
-            (norm.id, norm.observed_at, norm.payload, norm.reviewer_notes),
-        )
-        return WriteResult(legacy_id=legacy.id, evidence_id=norm.id)

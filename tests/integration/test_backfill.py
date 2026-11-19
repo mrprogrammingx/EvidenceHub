@@ -10,7 +10,14 @@ from sqlalchemy import Engine
 from evidencehub.common.snowflake import backfill_id
 from evidencehub.migration.normalize import parse_observed_at
 
-from .legacy_fixtures import colliding_legacy_ids, insert_rows, load_script, make_row, seed
+from .legacy_fixtures import (
+    colliding_legacy_ids,
+    insert_rows,
+    load_script,
+    make_row,
+    same_bucket_entities,
+    seed,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -125,22 +132,55 @@ def test_id_collision_stops_and_names_legacy_ids(
     assert last == (None if chunk == 100 else a)  # checkpoint never passes the collision
 
 
-def test_duplicate_hash_rows_are_all_loaded_first_writer_owns_hash(
+def test_same_id_and_hash_for_another_entity_is_a_collision_not_a_skip(
     make_schema: Callable[[str], Engine],
 ) -> None:
-    engine = make_schema("bf_duphash")
+    """Two different legacy rows, one snowflake id, one content_hash, two entities.
+
+    Before the entity_pk comparison the second row was silently skipped as "already loaded".
+    """
+    engine = make_schema("bf_twin_entity")
+    a, b = colliding_legacy_ids()
+    e1, e2 = same_bucket_entities()
+    observed = "2024-02-10 12:00:00"
+    same = "cd" * 32
+    rng = random.Random(9)
+    insert_rows(
+        engine,
+        [
+            make_row(rng, id=a, entity_id=e1, observed_at=observed, content_hash=same),
+            make_row(rng, id=b, entity_id=e2, observed_at=observed, content_hash=same),
+        ],
+    )
+    ts = parse_observed_at(observed)
+    assert backfill_id(ts, e1, a) == backfill_id(ts, e2, b)
+
+    status, s = bf.run_pk_order(engine, "twin-entity", 1, None, 0.0)  # one row per batch
+    assert status == 4
+    assert b in " ".join(s["collisions"]) and "entity_pk" in " ".join(s["collisions"])
+    assert _scalar(engine, "SELECT COUNT(*) FROM evidence") == 1
+
+
+@pytest.mark.parametrize("order", ["forward", "reverse"])
+def test_duplicate_hash_rows_all_loaded_and_earliest_owns_hash(
+    make_schema: Callable[[str], Engine], order: str
+) -> None:
+    engine = make_schema(f"bf_duphash_{order}")
     rng = random.Random(5)
     same = "ab" * 32
     early = make_row(rng, content_hash=same, observed_at="2024-01-05 00:00:00")
     late = make_row(rng, content_hash=same, observed_at="2024-03-05 00:00:00")
     insert_rows(engine, [early, late])
-    status, s = bf.run_months(engine, MONTHS, 50, 0.0)
+    months = MONTHS if order == "forward" else list(reversed(MONTHS))
+    status, s = bf.run_months(engine, months, 50, 0.0)
     assert status == 0
     assert _scalar(engine, "SELECT COUNT(*) FROM evidence WHERE content_hash=UNHEX(%s)", same) == 2
     owner = _scalar(
         engine, "SELECT evidence_id FROM evidence_content_hash WHERE content_hash=UNHEX(%s)", same
     )
     early_id = backfill_id(parse_observed_at(early["observed_at"]), early["entity_id"], early["id"])
-    assert owner == early_id
-    assert sum(m["duplicates_of_earlier_hash"] for m in s) == 1
+    assert owner == early_id  # same owner whichever month is loaded first
+    # duplicate_of is the owner at write time: in reverse order the late row was written
+    # first and was the owner then, so it is not reported.
+    assert sum(m["duplicates_of_earlier_hash"] for m in s) == (1 if order == "forward" else 0)
     assert _verify(engine)["ok"]

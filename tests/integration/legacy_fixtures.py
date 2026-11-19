@@ -98,3 +98,16 @@ def colliding_legacy_ids() -> tuple[str, str]:
             return seen[residue], candidate
         seen[residue] = candidate
         i += 1
+
+
+def same_bucket_entities() -> tuple[str, str]:
+    """Two distinct legacy-shaped entity keys in the same virtual bucket (crc32 % 1024)."""
+    seen: dict[int, str] = {}
+    i = 0
+    while True:
+        key = f"entity-{i:08d}"
+        bucket = zlib.crc32(key.encode()) % 1024
+        if bucket in seen:
+            return seen[bucket], key
+        seen[bucket] = key
+        i += 1

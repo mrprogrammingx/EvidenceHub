@@ -3,10 +3,10 @@
 Rules (ADR 0004):
 
 * **Every legacy row gets an optimized row.** A duplicate ``content_hash`` never drops a
-  row. ``evidence_content_hash`` is first-writer-wins: it keeps pointing at the first id
-  inserted for that hash, and later rows report it as ``duplicate_of``.
+  row. ``evidence_content_hash`` points at the lowest id holding that hash, independent
+  of load order; other rows report it as ``duplicate_of``.
 * **Re-runs are safe.** A record whose ``(id, observed_at)`` already exists with the same
-  ``content_hash`` is the same legacy row loaded before; it is skipped.
+  ``content_hash`` and ``entity_pk`` is the same legacy row loaded before; it is skipped.
 * **Id collisions stop the write.** Two different rows with one id (same hash-derived
   bits, see ADR 0004) raise :class:`IdCollisionError` naming the legacy ids. Nothing from
   the batch is written (the caller rolls back). Quarantining instead would leave a legacy
@@ -134,18 +134,30 @@ def write_records(
     if collisions:
         raise IdCollisionError(collisions)
 
-    existing: dict[int, bytes] = {
-        int(eid): bytes(h)
-        for eid, h in conn.exec_driver_sql(
-            "SELECT id, content_hash FROM evidence WHERE (id, observed_at) IN "
+    # The optimized schema does not store legacy_id, so "same legacy row loaded before"
+    # is judged on the stored identity: (id, observed_at) via the IN, plus content_hash and
+    # entity_pk. A twin that differs in either is a collision. A twin identical in all of
+    # them is indistinguishable here; verify_backfill's per-month COUNT catches it (ADR 0004).
+    existing: dict[int, tuple[bytes, int]] = {
+        int(eid): (bytes(h), int(epk))
+        for eid, h, epk in conn.exec_driver_sql(
+            "SELECT id, content_hash, entity_pk FROM evidence WHERE (id, observed_at) IN "
             f"({_row_placeholders(len(recs))})",
             tuple(v for r in recs for v in (r.id, r.observed_at)),
         )
     }
     for r in recs:
-        if r.id in existing and existing[r.id] != r.content_hash:
+        if r.id not in existing:
+            continue
+        old_hash, old_entity = existing[r.id]
+        if old_hash != r.content_hash:
             collisions.append(
                 f"id {r.id} for legacy {r.legacy_id} already holds a row with a different hash"
+            )
+        elif old_entity != r.entity_pk:
+            collisions.append(
+                f"id {r.id} for legacy {r.legacy_id} already holds a row for entity_pk "
+                f"{old_entity}, not {r.entity_pk}"
             )
     if collisions:
         raise IdCollisionError(collisions)
@@ -179,9 +191,12 @@ def write_records(
             "VALUES (%s,%s,%s,%s)",
             [(r.id, r.observed_at, r.payload, r.reviewer_notes) for r in todo],
         )
+        # Lowest id owns the hash, whatever order rows arrive in. For backfilled ids the
+        # time bits are observed_at, so this is "earliest observed_at, ties by id" (ADR 0004).
+        # VALUES() (not a row alias) keeps pymysql's multi-row executemany rewrite working.
         conn.exec_driver_sql(
             "INSERT INTO evidence_content_hash (content_hash, evidence_id) VALUES (%s,%s) "
-            "ON DUPLICATE KEY UPDATE evidence_id = evidence_id",
+            "ON DUPLICATE KEY UPDATE evidence_id = LEAST(evidence_id, VALUES(evidence_id))",
             [(r.content_hash, r.id) for r in todo],
         )
 

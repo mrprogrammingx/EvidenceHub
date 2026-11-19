@@ -47,8 +47,17 @@ Accepted (P2). Code: `evidencehub/common/snowflake.py`.
   Tested with a natural collision found by birthday search
   (`tests/integration/test_backfill.py::test_id_collision_stops_and_names_legacy_ids`).
 - **Re-runs vs. collisions.** An existing `(id, observed_at)` with the *same*
-  `content_hash` is the same legacy row loaded earlier (PK-order sample, an interrupted
-  month, a forgotten checkpoint) and is skipped. Only a *different* hash is a collision.
+  `content_hash` **and the same `entity_pk`** is the same legacy row loaded earlier
+  (PK-order sample, an interrupted month, a forgotten checkpoint) and is skipped. A
+  different hash or a different `entity_pk` is a collision and raises. Tested with a
+  natural twin (colliding legacy ids, two entities in one bucket, one hash):
+  `test_same_id_and_hash_for_another_entity_is_a_collision_not_a_skip`.
+- **Residual limit.** `evidence` does not store `legacy_id` (it would cost ~36+ bytes/row
+  on a disk budget that is already tight), so two legacy rows identical in id, hash and
+  entity cannot be told apart from a re-run, and the second would be skipped. That needs
+  a crc32 collision on the legacy id, the same second, the same entity *and* the same
+  content hash. If it happens, `verify_backfill.py` reports that month's `COUNT` as one
+  short, so it cannot pass verification unnoticed.
 - **Live writes:** unique and monotonic per bucket **within one process** (a lock plus
   per-bucket last-ms and sequence; clock steps backwards are absorbed). The layout has no
   worker bits, so **two processes generating ids for the same bucket can collide**, and
@@ -60,15 +69,29 @@ Accepted (P2). Code: `evidencehub/common/snowflake.py`.
 
 ### Duplicate content hashes: one rule for both write paths
 
-**Every legacy row gets an optimized row; `evidence_content_hash` is first-writer-wins.**
-The backfill and the dual-writer both write through
+**Every legacy row gets an optimized row; `evidence_content_hash` is owned by the lowest
+id.** The backfill and the dual-writer both write through
 `evidencehub/migration/writer.py::write_records`, so the rule cannot drift between them:
 
 - the `evidence` and `evidence_payload` rows are always written;
-- `evidence_content_hash` keeps pointing at the first id inserted for that hash
-  (`INSERT ... ON DUPLICATE KEY UPDATE evidence_id = evidence_id`);
-- later rows are reported as `duplicate_of = <first id>`. Ingestion (P4) decides what to do
-  with that signal; the storage layer never drops a row.
+- `evidence_content_hash` points at the **lowest** id holding that hash
+  (`ON DUPLICATE KEY UPDATE evidence_id = LEAST(evidence_id, VALUES(evidence_id))`). The
+  upsert is atomic under the row lock, so the owner does not depend on load order or on
+  which writer gets there first. Changed 2026-11-19 from first-writer-wins, which made the
+  owner depend on load order;
+- for backfilled ids the time bits are `observed_at`, so lowest id means **earliest
+  `observed_at`, ties broken by id**. Tested both ways round:
+  `test_duplicate_hash_rows_all_loaded_and_earliest_owns_hash[forward|reverse]`;
+- `duplicate_of` in a write's result is the owner *at write time*. If an earlier-observed
+  row arrives later, it takes ownership and the row written first was not reported as a
+  duplicate. Ingestion (P4) decides what to do with that signal; the storage layer never
+  drops a row.
+
+**Known limit (live ids).** Live ids take their time from ingest time, not `observed_at`.
+Between a live row and a backfilled row with the same hash, the backfilled row (older id
+time) wins even if the live row has an earlier `observed_at`. Making that exact needs the
+owner's `observed_at` stored in `evidence_content_hash`, which is deferred to P4 with the
+real ingestion path.
 
 The P2 dual-writer previously skipped the optimized row on a duplicate. That was changed
 so the optimized table holds every legacy row, as the cutover requires.

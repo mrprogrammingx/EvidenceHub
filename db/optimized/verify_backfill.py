@@ -238,6 +238,109 @@ def check_dims(conn: Connection, last_id: str) -> dict[str, Any]:
 MAX_LEGACY_ID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 
 
+def _month_bounds(month: str) -> tuple[str, str]:
+    y, m = map(int, month.split("-"))
+    nxt = f"{y + 1:04d}-01" if m == 12 else f"{y:04d}-{m + 1:02d}"
+    return f"{month}-01 00:00:00", f"{nxt}-01 00:00:00"
+
+
+def verify_month(engine: Any, month: str, chunk: int, spot: int, seed: int) -> dict[str, Any]:
+    """Verify one observed_at month: every legacy row has exactly one matching new row.
+
+    One streamed legacy scan (there is no legacy observed_at index) feeds the per-chunk
+    CRC and a reservoir sample for the spot-check. The new side is read by partition.
+    """
+    lo, hi = _month_bounds(month)
+    rng = random.Random(seed)
+    reservoir: list[Any] = []
+    legacy_n, legacy_crc, chunks = 0, 0, 0
+    bad: list[dict[str, Any]] = []
+    with engine.connect() as conn, engine.connect().execution_options(stream_results=True) as rconn:
+        res = rconn.exec_driver_sql(
+            f"SELECT {LEGACY_COLS} FROM evidence_legacy "
+            "WHERE observed_at >= %s AND observed_at < %s",
+            (lo, hi),
+        )
+        while batch := res.fetchmany(chunk):
+            keys = [(n.id, n.observed_at) for n in map(normalize_legacy_row, batch)]
+            new = conn.exec_driver_sql(
+                NEW_ROW_SQL
+                + f"WHERE (e.id, e.observed_at) IN ({','.join(['(%s,%s)'] * len(keys))})",
+                tuple(v for k in keys for v in k),
+            ).fetchall()
+            lsum, nsum = _crc_sum(map(canon_legacy, batch)), _crc_sum(map(canon_new, new))
+            if len(new) != len(batch) or lsum != nsum:
+                bad.append({"chunk": chunks, "legacy_n": len(batch), "new_n": len(new)})
+            for r in batch:
+                legacy_n += 1
+                if len(reservoir) < spot:
+                    reservoir.append(r)
+                elif (j := rng.randrange(legacy_n)) < spot:
+                    reservoir[j] = r
+            legacy_crc += lsum
+            chunks += 1
+        new_agg = conn.exec_driver_sql(
+            NEW_MONTH_SQL.replace(
+                "GROUP BY", "WHERE e.observed_at >= %s AND e.observed_at < %s GROUP BY"
+            ),
+            (lo, hi),
+        ).fetchall()
+        dup_groups = conn.exec_driver_sql(
+            "SELECT COUNT(*) - COUNT(DISTINCT entity_pk, observed_at, content_hash) FROM evidence "
+            "WHERE observed_at >= %s AND observed_at < %s",
+            (lo, hi),
+        ).scalar_one()
+        failures: list[dict[str, Any]] = []
+        for r in reservoir:
+            expected = normalize_legacy_row(r)
+            found = conn.exec_driver_sql(
+                NEW_ROW_SQL
+                + "WHERE d.entity_key = %s AND e.observed_at = %s AND e.content_hash = %s",
+                (r.entity_id, expected.observed_at, expected.content_hash),
+            ).fetchall()
+            problems = []
+            if len(found) != 1:
+                problems.append(f"found {len(found)} rows via entity/observed_at/hash")
+            else:
+                if found[0].id != expected.id:
+                    problems.append(f"id {found[0].id} != expected {expected.id}")
+                for i, (a, b) in enumerate(zip(canon_legacy(r), canon_new(found[0]), strict=True)):
+                    if a != b:
+                        problems.append(f"field {i}: {a!r} != {b!r}")
+            if problems:
+                failures.append({"legacy_id": r.id, "problems": problems})
+        conn.rollback()
+    new_n = sum(r.n for r in new_agg)
+    sql_crc_new = sum(int(r.crc) for r in new_agg)
+    with engine.connect() as conn:
+        legacy_sql = conn.exec_driver_sql(
+            LEGACY_MONTH_SQL.replace(
+                "WHERE id <= %s", "WHERE observed_at >= %s AND observed_at < %s"
+            ),
+            (lo, hi),
+        ).fetchall()
+    result: dict[str, Any] = {
+        "month": month,
+        "legacy_rows": legacy_n,
+        "new_rows": new_n,
+        "sql_checksum_equal": [(r.n, int(r.crc)) for r in legacy_sql]
+        == [(r.n, int(r.crc)) for r in new_agg],
+        "sql_checksum_new": sql_crc_new,
+        "chunks": chunks,
+        "mismatched_chunks": bad,
+        "duplicate_rows_by_entity_observed_hash": int(dup_groups),
+        "spot": {"checked": len(reservoir), "failures": failures},
+    }
+    result["ok"] = (
+        legacy_n == new_n
+        and result["sql_checksum_equal"]
+        and not bad
+        and not failures
+        and dup_groups == 0
+    )
+    return result
+
+
 def verify(conn: Connection, last_id: str, chunk: int, spot: int, seed: int) -> dict[str, Any]:
     result = {
         "last_legacy_id": last_id,
@@ -261,11 +364,16 @@ def main() -> None:
     scope = p.add_mutually_exclusive_group(required=True)
     scope.add_argument("--job", help="verify the legacy PK range a pk-order job covered")
     scope.add_argument("--all", action="store_true", help="verify the whole legacy table")
+    scope.add_argument("--month", help="YYYY-MM: verify one observed_at month")
     p.add_argument("--chunk", type=int, default=2000)
     p.add_argument("--spot", type=int, default=200)
     p.add_argument("--seed", type=int, default=20261119)
     a = p.parse_args()
     engine = create_engine(get_settings().shard_url(a.shard), pool_pre_ping=True)
+    if a.month:
+        month_result = verify_month(engine, a.month, a.chunk, a.spot, a.seed)
+        print(json.dumps(month_result, indent=2, default=str))
+        sys.exit(0 if month_result["ok"] else 1)
     with engine.connect() as conn:
         if a.all:
             last_id = MAX_LEGACY_ID

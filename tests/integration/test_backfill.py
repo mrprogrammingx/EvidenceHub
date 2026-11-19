@@ -184,3 +184,32 @@ def test_duplicate_hash_rows_all_loaded_and_earliest_owns_hash(
     # first and was the owner then, so it is not reported.
     assert sum(m["duplicates_of_earlier_hash"] for m in s) == (1 if order == "forward" else 0)
     assert _verify(engine)["ok"]
+
+
+def test_verify_month_passes_on_overlap_and_catches_missing_or_altered_rows(
+    make_schema: Callable[[str], Engine],
+) -> None:
+    engine = make_schema("bf_verify_month")
+    seed(engine, 500, seed_value=21)
+    assert bf.run_pk_order(engine, "sample", 100, 200, 0.0)[0] == 0  # PK-order overlap first
+    assert bf.run_month(engine, "2024-02", 40, 0.0)[0] == 0
+    good = vf.verify_month(engine, "2024-02", 40, 25, 1)
+    assert good["ok"], good
+    assert good["legacy_rows"] == good["new_rows"] > 0
+    assert good["duplicate_rows_by_entity_observed_hash"] == 0
+
+    with engine.begin() as conn:  # alter one stored value
+        conn.exec_driver_sql(
+            "UPDATE evidence SET status = IF(status = 1, 2, 1) "
+            "WHERE observed_at >= '2024-02-01' AND observed_at < '2024-03-01' ORDER BY id LIMIT 1"
+        )
+    altered = vf.verify_month(engine, "2024-02", 40, 25, 1)
+    assert not altered["ok"] and altered["mismatched_chunks"] and not altered["sql_checksum_equal"]
+
+    with engine.begin() as conn:  # drop one row
+        conn.exec_driver_sql(
+            "DELETE FROM evidence "
+            "WHERE observed_at >= '2024-02-01' AND observed_at < '2024-03-01' ORDER BY id LIMIT 1"
+        )
+    missing = vf.verify_month(engine, "2024-02", 40, 25, 1)
+    assert not missing["ok"] and missing["new_rows"] == missing["legacy_rows"] - 1

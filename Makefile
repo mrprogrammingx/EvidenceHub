@@ -56,6 +56,11 @@ ps:
 migrate-legacy: .env
 	$(UV) run alembic -c db/legacy/alembic.ini upgrade head
 
+SHARD ?=
+migrate-optimized: .env
+	@test -n "$(SHARD)" || (echo "Usage: make migrate-optimized SHARD=<index|all>"; exit 2)
+	$(UV) run alembic -c db/optimized/alembic.ini -x shard=$(SHARD) upgrade head
+
 seed: .env
 	$(UV) run python db/legacy/seed_legacy.py
 

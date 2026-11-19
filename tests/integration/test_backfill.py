@@ -213,3 +213,68 @@ def test_verify_month_passes_on_overlap_and_catches_missing_or_altered_rows(
         )
     missing = vf.verify_month(engine, "2024-02", 40, 25, 1)
     assert not missing["ok"] and missing["new_rows"] == missing["legacy_rows"] - 1
+
+
+def test_pre_cursor_progress_row_rescan_does_not_double_count_rows_written(
+    make_schema: Callable[[str], Engine],
+) -> None:
+    """A progress row from before migration 0003 has rows_written but no cursor/completed_at.
+
+    The month is rescanned from the start (every row skipped); rows_written must end at the
+    month's row count, not the stale count plus the rescan.
+    """
+    engine = make_schema("bf_stale_progress")
+    rows = seed(engine, 300, seed_value=31)
+    feb = sum(1 for r in rows if r["observed_at"].startswith("2024-02"))
+    assert bf.run_month(engine, "2024-02", 40, 0.0)[0] == 0
+    with engine.begin() as conn:  # the shape a pre-0003 row has after the migration adds columns
+        conn.exec_driver_sql(
+            "UPDATE backfill_progress SET cursor_observed_at = NULL, completed_at = NULL, "
+            "last_legacy_id = '' WHERE job = 'month-2024-02'"
+        )
+    status, s = bf.run_month(engine, "2024-02", 40, 0.0)
+    assert (status, s["inserted"], s["skipped_existing"]) == (0, 0, feb)
+    assert s["rows_written_total_for_month"] == feb
+    assert (
+        _scalar(engine, "SELECT rows_written FROM backfill_progress WHERE job='month-2024-02'")
+        == feb
+    )
+    assert _scalar(engine, "SELECT COUNT(*) FROM evidence") == feb
+
+
+def _binlog_bytes(engine: Engine) -> int:
+    with engine.connect() as conn:
+        return sum(int(r[1]) for r in conn.exec_driver_sql("SHOW BINARY LOGS"))
+
+
+def test_session_no_binlog_writes_rows_but_no_binlog(
+    make_schema: Callable[[str], Engine], mysql_root_url: str
+) -> None:
+    from sqlalchemy import create_engine
+
+    engine = make_schema("bf_nobinlog")
+    seed(engine, 200, seed_value=41)
+    quiet = create_engine(engine.url)
+    bf.disable_session_binlog(quiet)
+    before = _binlog_bytes(engine)
+    assert bf.run_month(quiet, "2024-01", 40, 0.0)[0] == 0
+    assert _scalar(engine, "SELECT COUNT(*) FROM evidence") > 0
+    assert _binlog_bytes(engine) == before  # nothing logged by the quiet sessions
+    assert bf.run_month(engine, "2024-02", 40, 0.0)[0] == 0
+    assert _binlog_bytes(engine) > before  # control: a normal session does log
+
+
+def test_session_no_binlog_without_privilege_refuses(
+    make_schema: Callable[[str], Engine], mysql_root_url: str
+) -> None:
+    from sqlalchemy import create_engine
+
+    engine = make_schema("bf_nobinlog_denied")
+    admin = create_engine(mysql_root_url)
+    with admin.begin() as conn:
+        conn.exec_driver_sql("DROP USER IF EXISTS 'appuser'@'%%'")
+        conn.exec_driver_sql("CREATE USER 'appuser'@'%%' IDENTIFIED BY 'app-test-pw'")
+        conn.exec_driver_sql("GRANT ALL PRIVILEGES ON bf_nobinlog_denied.* TO 'appuser'@'%%'")
+    app = create_engine(engine.url.set(username="appuser", password="app-test-pw"))
+    with pytest.raises(bf.SessionBinlogError, match="1227"):
+        bf.disable_session_binlog(app)

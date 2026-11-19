@@ -12,7 +12,11 @@ stop the run:
 
 Each batch is one transaction that also advances the checkpoint in ``backfill_progress``.
 Exit codes: 0 done, 3 stopped by the free-disk guardrail (checkpoint saved), 4 stopped on
-an id collision (batch rolled back, legacy ids logged).
+an id collision (batch rolled back, legacy ids logged), 5 ``--session-no-binlog`` was
+requested but the session could not turn binary logging off (nothing read or written).
+
+``--session-no-binlog`` runs ``SET SESSION sql_log_bin=0`` on every connection this
+process opens. It never touches global settings; it needs SESSION_VARIABLES_ADMIN.
 Additive only: reads `evidence_legacy`, writes the new tables.
 """
 
@@ -32,7 +36,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from sqlalchemy import Connection, Engine, create_engine  # noqa: E402
+from sqlalchemy import Connection, Engine, create_engine, event  # noqa: E402
 
 from evidencehub.common.config import get_settings  # noqa: E402
 from evidencehub.migration.normalize import normalize_legacy_row  # noqa: E402
@@ -40,7 +44,7 @@ from evidencehub.migration.writer import Dims, IdCollisionError, write_records  
 
 logger = logging.getLogger("evidencehub.backfill")
 GIB = 1024**3
-EXIT_OK, EXIT_DISK, EXIT_COLLISION = 0, 3, 4
+EXIT_OK, EXIT_DISK, EXIT_COLLISION, EXIT_BINLOG = 0, 3, 4, 5
 
 LEGACY_COLUMNS = (
     "id, entity_id, entity_name, source_name, source_type, evidence_type, status, "
@@ -186,7 +190,10 @@ def run_month(
             if progress is not None and progress.cursor_observed_at
             else None
         )
-        written = progress.rows_written if progress is not None else 0
+        # rows_written only carries over when resuming after a cursor. Without one (no row,
+        # or a row from before migration 0003) the month is rescanned from its start, so a
+        # stale count would be added to a full recount.
+        written = progress.rows_written if cursor is not None and progress is not None else 0
         sql = (
             f"SELECT {LEGACY_COLUMNS} FROM evidence_legacy "
             "WHERE observed_at >= %s AND observed_at < %s"
@@ -272,6 +279,34 @@ def run_months(
     return EXIT_OK, summaries
 
 
+class SessionBinlogError(RuntimeError):
+    pass
+
+
+def disable_session_binlog(engine: Engine) -> None:
+    """Turn binary logging off for every session this engine opens; verify before use.
+
+    Session scope only. If the server refuses (missing privilege), raise
+    SessionBinlogError; the caller must stop rather than run with binlogs on.
+    """
+
+    @event.listens_for(engine, "connect")
+    def _off(dbapi_conn: Any, _record: Any) -> None:
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute("SET SESSION sql_log_bin = 0")
+        finally:
+            cur.close()
+
+    try:
+        with engine.connect() as conn:
+            value = conn.exec_driver_sql("SELECT @@session.sql_log_bin").scalar_one()
+    except Exception as exc:  # the SET in the connect hook failed
+        raise SessionBinlogError(f"could not SET SESSION sql_log_bin=0: {exc}") from exc
+    if int(value) != 0:
+        raise SessionBinlogError(f"@@session.sql_log_bin is {value} after SET")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--shard", type=int, required=True, help="0-based shard index")
@@ -282,9 +317,21 @@ def main() -> None:
     p.add_argument("--months", default=None, help="START:END, e.g. 2023-01:2026-09")
     p.add_argument("--min-free-gib", type=float, default=10.0)
     p.add_argument("--metrics-out", type=Path, default=None)
+    p.add_argument(
+        "--session-no-binlog",
+        action="store_true",
+        help="SET SESSION sql_log_bin=0 on every connection; exit 5 if refused",
+    )
     a = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     engine = create_engine(get_settings().shard_url(a.shard), pool_pre_ping=True)
+    if a.session_no_binlog:
+        try:
+            disable_session_binlog(engine)
+        except SessionBinlogError as exc:
+            logger.error("STOP: %s", exc)
+            sys.exit(EXIT_BINLOG)
+        logger.info("session binary logging is off for this process (sql_log_bin=0)")
     out: Any
     if a.months:
         start, end = a.months.split(":")

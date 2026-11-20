@@ -74,6 +74,12 @@ The row counts differ by about 5.3x, so fixed per-partition overhead is spread o
 rows on shard 2. That inflates the file-based gain; the page-stat figures are the less
 biased comparison.
 
+**Caveat (2026-11-20).** The page-stat figures in this table were read from
+`information_schema` without `information_schema_stats_expiry=0`, so they may be cached
+values. They are kept as the record of the go/no-go decision, not as size claims. The
+full-shard sizes in `docs/perf/backfill.md` supersede them: they are measured both as
+`.ibd` file size (`stat`) and as fresh pages in use (`stats_expiry=0`).
+
 Go/no-go rule (owner, 2026-11-19): month-ordered only if bytes/row drops ≥25% **and** the
 per-month legacy scan is about 2 minutes or less. Bytes/row passes clearly. The scan
 measured 135.1s, about 15s over. **Outcome: pending the owner's decision**, because the
@@ -92,3 +98,23 @@ an interrupted one resumes after its cursor. Rows already loaded by the PK-order
 shard 1 are skipped by `write_records`. On shard 1 the month-ordered rows still interleave
 with the 1M sample rows already in each partition, so its density will land between the
 two measured figures.
+
+## Results and binary logging (2026-11-20)
+
+Measured per-shard results are in `docs/perf/backfill.md`. Shards 1 and 2 are loaded and
+pass `verify_backfill --all`. On shard 2, loaded in month order from almost empty, the
+optimized tables are 0.696 of legacy by file size and 0.605 by pages in use. Shard 1 is
+1.025 / 0.922, because the 1M sample rows loaded in PK order fragment its tables (most of
+all `evidence_payload`).
+
+**Session-only binary logging off.** `backfill.py --session-no-binlog` runs
+`SET SESSION sql_log_bin=0` on every connection the backfill opens and checks
+`@@session.sql_log_bin = 0` before reading anything; if the server refuses, the run exits
+5 and does nothing. It never changes a global setting. It requires
+`SESSION_VARIABLES_ADMIN`, which the app user does not hold; for shard 2 the owner
+approved granting it to `evidencehub@%` on that shard only for the duration of the load,
+and it was revoked when the load exited. With it, shard 2's 5,122,583-row load added no
+binlog bytes; shard 1's load with binlogs on wrote 427.6 B per inserted row.
+Consequence: rows loaded this way are not in the binlog, so a replica or point-in-time
+recovery from binlogs would not contain them. There are no replicas in this setup; any
+future one must be seeded from a fresh snapshot taken after the load.

@@ -112,8 +112,10 @@ non-partitioned, so it can enforce uniqueness where `evidence` cannot (ADR 0002)
 
 It is **per shard**. Placement is by entity, so identical content attached to two
 entities on different shards is not detected. **Cross-shard dedup is out of scope until
-P3's global lookup index.** The shard-1 sample had no duplicate hashes (1,000,000 rows,
-1,000,000 distinct), so this does not affect the before/after comparison.
+P3's global lookup index.** Measured on the fully loaded shards: shard 1 has 5,247,983
+rows and 5,247,983 distinct hashes, shard 2 has 5,238,270 and 5,238,270, so no row on
+either shard is a duplicate and per-shard scope does not affect the before/after
+comparison there.
 
 ### `entity_pk` allocation (known limit)
 
